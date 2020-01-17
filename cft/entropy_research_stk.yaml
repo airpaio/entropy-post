@@ -1,0 +1,357 @@
+Parameters:
+  NameOfService:
+    Description: "This stack will be used for linux system entropy research."
+    Type: String
+    Default: entropy-research
+  AMIParamRHEL6:
+    Description: ID of RHEL6 AMI in us-east-1
+    Type: AWS::EC2::Image::Id
+    Default: ami-1a0a540d
+  AMIParamRHEL8:
+    Description: ID of RHEL8 AMI in us-east-1
+    Type: AWS::EC2::Image::Id
+    Default: ami-0c322300a1dd5dc79
+  InstanceTypeParam:
+    Description: EC2 Instance Type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+  KeyNameParam:
+    Description: Name of the EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+  SubnetParam:
+    Description: ID of Subnet under which resources are to be created
+    Type: AWS::EC2::Subnet::Id
+  VPCParam:
+    Description: ID of VPC under which resources are to be created
+    Type: AWS::EC2::VPC::Id
+  KMSKeyID:
+    Description: ID of the KMS Key to be used for S3 Bucket encryption
+    Type: String
+    Default: ''
+  IAMRole:
+    Description: Specify an IAM Role to give the EC2 resources
+    Type: String
+    Default: entropy-research-s3-upload
+  BucketName:
+    Description: Specify the name of the S3 bucket you want to create
+    Type: String
+    Default: ''
+
+Resources:
+  RHEL6Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /home/ec2-user/count.txt:
+              content: !Sub |
+                0
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/entropy_check.py:
+              content: !Sub |
+                import boto3
+                import csv
+                import os
+                import subprocess
+                import time
+
+                # check entropy for 5 minutes
+                seconds = 0
+                N = 360
+                results = [["seconds", "count", "entropy_avail"]]
+                filename_abs = '/home/ec2-user/RHEL6_entropy_results.csv'
+                filename_rel = 'RHEL6_entropy_results.csv'
+
+                for i in range(N):
+                    with open("count.txt", "r") as f:
+                        count = f.readline()
+                    entropy = os.popen('cat /proc/sys/kernel/random/entropy_avail').read()
+                    entropy = int(entropy.strip('\n'))
+                    results.append([seconds, count, entropy])
+                    time.sleep(1)
+                    seconds += 1
+
+                # write to .csv
+                with open(filename_abs, "w") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(results)
+
+                # upload to s3
+                bucket = 'entropy'
+                object_name = filename_rel
+                s3_client = boto3.client('s3')
+                response = s3_client.upload_file(filename_abs, bucket, object_name, ExtraArgs={"ServerSideEncryption": "aws:kms"})
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/entropy_blocking.py:
+              content: !Sub |
+                import os
+
+                # run a /dev/random blocking command
+                count = 0
+                while True:
+                    read_random = os.system('head -c 32 /dev/random | base64 >> rchars.txt')
+                    count += 1
+                    with open('count.txt', 'w') as f:
+                        f.write(str(count))
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/run_entropy.sh:
+              content: !Sub |
+                #!/bin/bash
+
+                echo "Starting entropy check"
+                python3 /home/ec2-user/entropy_check.py &
+                echo "Sleeping for 30 secs"
+                sleep 30
+                echo "Starting entropy blocking"
+                python3 /home/ec2-user/entropy_blocking.py &
+                echo "Entropy experiment is running in background."
+                echo "Run command 'ps -ef | grep python' to find PIDs for background jobs."
+              owner: "ec2-user"
+              group: "ec2-user"
+    Properties:
+      InstanceType: !Ref InstanceTypeParam
+      ImageId: !Ref AMIParamRHEL6
+      KeyName: !Ref KeyNameParam
+      IamInstanceProfile: !Ref IAMRole
+      SubnetId: !Ref SubnetParam
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      BlockDeviceMappings:
+        -
+          DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp2
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: entropy-research-RHEL6
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # get python-pip for python2
+          cd /home/ec2-user
+          wget https://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm
+          rpm -ivh epel-release-latest-6.noarch.rpm
+          yum install python-pip -y
+          yum groupinstall 'Development Tools' -y
+          # install python36
+          yum install gcc openssl-devel bzip2-devel sqlite-devel -y
+          cd /home/ec2-user
+          wget https://www.python.org/ftp/python/3.6.8/Python-3.6.8.tgz
+          tar zxvf Python-3.6.8.tgz
+          cd Python-3.6.8
+          ./configure --prefix=/opt/python3
+          make
+          make install
+          ln -s /opt/python3/bin/python3 /usr/bin/python3
+          ln -s /opt/python3/bin/pip3 /usr/bin/pip3
+          # prepare env to make use of AWS::CloudFormation::Init:
+          # rpm -ivh http://dl.fedoraproject.org/pub/epel/6/x86_64/epel-release-6-8.noarch.rpm
+          cd /usr/bin
+          pip install pystache
+          pip install argparse
+          pip install python-daemon
+          pip install requests
+          yum install -y https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-1.4-5.amzn1.noarch.rpm
+          # Install the files and packages from the metadata
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource RHEL6Instance  --region ${AWS::Region}
+          pip3 install boto3
+
+  RHEL8Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /home/ec2-user/count.txt:
+              content: !Sub |
+                0
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/entropy_check.py:
+              content: !Sub |
+                import boto3
+                import csv
+                import os
+                import subprocess
+                import time
+
+                # check entropy for 5 minutes
+                seconds = 0
+                N = 360
+                results = [["seconds", "count", "entropy_avail"]]
+                filename_abs = '/home/ec2-user/RHEL8_entropy_results.csv'
+                filename_rel = 'RHEL8_entropy_results.csv'
+
+                for i in range(N):
+                    with open("count.txt", "r") as f:
+                        count = f.readline()
+                    entropy = os.popen('cat /proc/sys/kernel/random/entropy_avail').read()
+                    entropy = int(entropy.strip('\n'))
+                    results.append([seconds, count, entropy])
+                    time.sleep(1)
+                    seconds += 1
+
+                # write to .csv
+                with open(filename_abs, "w") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(results)
+
+                # upload to s3
+                bucket = 'entropy'
+                object_name = filename_rel
+                s3_client = boto3.client('s3')
+                response = s3_client.upload_file(filename_abs, bucket, object_name, ExtraArgs={"ServerSideEncryption": "aws:kms"})
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/entropy_blocking.py:
+              content: !Sub |
+                import os
+
+                # run a /dev/random blocking command
+                count = 0
+                while True:
+                    read_random = os.system('head -c 32 /dev/random | base64 >> rchars.txt')
+                    count += 1
+                    with open('count.txt', 'w') as f:
+                        f.write(str(count))
+              owner: "ec2-user"
+              group: "ec2-user"
+            /home/ec2-user/run_entropy.sh:
+              content: !Sub |
+                #!/bin/bash
+
+                echo "Starting entropy check"
+                python3 /home/ec2-user/entropy_check.py &
+                echo "Sleeping for 30 secs"
+                sleep 30
+                echo "Starting entropy blocking"
+                python3 /home/ec2-user/entropy_blocking.py &
+                echo "Entropy experiment is running in background."
+                echo "Run command 'ps -ef | grep python' to find PIDs for background jobs."
+              owner: "ec2-user"
+              group: "ec2-user"
+    Properties:
+      InstanceType: !Ref InstanceTypeParam
+      ImageId: !Ref AMIParamRHEL8
+      KeyName: !Ref KeyNameParam
+      IamInstanceProfile: !Ref IAMRole
+      SubnetId: !Ref SubnetParam
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      BlockDeviceMappings:
+        -
+          DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp2
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: entropy-research-RHEL8
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # install python36
+          yum update -y
+          yum install python36 -y
+          yum install python2 -y
+          ln -s /usr/bin/python2 /usr/bin/python
+          ln -s /usr/bin/pip2 /usr/bin/pip
+          # prepare env to make use of AWS::CloudFormation::Init:
+          rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+          #rpm -ivh http://dl.fedoraproject.org/pub/epel/7/x86_64/Packages/e/epel-release-7-12.noarch.rpm
+          pip install pystache
+          pip install argparse
+          pip install python-daemon
+          pip install requests
+          cd /opt
+          curl -O https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          tar -xvpf aws-cfn-bootstrap-latest.tar.gz
+          cd aws-cfn-bootstrap-1.4/
+          python setup.py build
+          python setup.py install
+          ln -s /usr/init/redhat/cfn-hup /etc/init.d/cfn-hup
+          chmod 775 /usr/init/redhat/cfn-hup
+          cd /opt
+          mkdir aws
+          cd aws
+          mkdir bin
+          ln -s /usr/bin/cfn-hup /opt/aws/bin/cfn-hup
+          ln -s /usr/bin/cfn-init /opt/aws/bin/cfn-init
+          ln -s /usr/bin/cfn-signal /opt/aws/bin/cfn-signal
+          ln -s /usr/bin/cfn-elect-cmd-leader /opt/aws/bin/cfn-elect-cmd-leader
+          ln -s /usr/bin/cfn-get-metadata /opt/aws/bin/cfn-get-metadata
+          ln -s /usr/bin/cfn-send-cmd-event /opt/aws/bin/cfn-send-cmd-event
+          ln -s /usr/bin/cfn-send-cmd-result /opt/aws/bin/cfn-send-cmd-result
+          # Install the files and packages from the metadata
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource RHEL8Instance  --region ${AWS::Region}
+          pip3 install boto3
+
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: entropy-research-sg
+      GroupDescription: Open Ports 22, 80, and 443
+      VpcId: !Ref VPCParam
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+        Description: ssh
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+        Description: http
+      - IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        CidrIp: 0.0.0.0/0
+        Description: https
+
+  S3BucketResource:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref BucketName
+      Tags:
+        - Key: Name
+          Value: entropy-research
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KMSKeyID
+              SSEAlgorithm: "aws:kms"
+
+  S3BucketResourcePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketResource
+      PolicyDocument:
+        Statement:
+          - Action: "s3:*"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/entropy-research-s3-upload'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketResource}/*'
+
+Outputs:
+  RHEL6Instance:
+    Description: The Public DNS for the RHEL6 EC2 Instance
+    Value: !Sub 'http://${RHEL6Instance.PublicDnsName}'
+  RHEL8Instance:
+    Description: The Public DNS for the RHEL8 EC2 Instance
+    Value: !Sub 'http://${RHEL8Instance.PublicDnsName}'
