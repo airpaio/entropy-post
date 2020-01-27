@@ -12,7 +12,7 @@ Parameters:
     Type: AWS::EC2::Image::Id
     Default: ami-0c322300a1dd5dc79
   InstanceTypeParam:
-    Description: EC2 Instance Type
+    Description: EC2 Instance Type (choose t2.micro to start with for experimentation purposes)
     Type: String
     Default: t2.micro
     AllowedValues:
@@ -31,10 +31,10 @@ Parameters:
     Description: ID of the KMS Key to be used for S3 Bucket encryption
     Type: String
     Default: ''
-  IAMRole:
-    Description: Specify an IAM Role to give the EC2 resources
-    Type: String
-    Default: entropy-research-s3-upload
+  # IAMRole:
+  #   Description: Specify an IAM Role to give the EC2 resources
+  #   Type: String
+  #   Default: entropy-research-s3-upload
   BucketName:
     Description: Specify the name of the S3 bucket you want to create
     Type: String
@@ -86,6 +86,9 @@ Resources:
                 object_name = filename_rel
                 s3_client = boto3.client('s3')
                 response = s3_client.upload_file(filename_abs, bucket, object_name, ExtraArgs={"ServerSideEncryption": "aws:kms"})
+
+                # kill the entropy_blocking.py script
+                os.system(ps -ef | grep /home/ec2-user/entropy_blocking.py | grep -v grep | awk '{print $2}' | xargs kill)
               owner: "ec2-user"
               group: "ec2-user"
             /home/ec2-user/entropy_blocking.py:
@@ -119,7 +122,7 @@ Resources:
       InstanceType: !Ref InstanceTypeParam
       ImageId: !Ref AMIParamRHEL6
       KeyName: !Ref KeyNameParam
-      IamInstanceProfile: !Ref IAMRole
+      IamInstanceProfile: !Ref EntropyInstanceProfile
       SubnetId: !Ref SubnetParam
       SecurityGroupIds:
         - !Ref MySecurityGroup
@@ -164,6 +167,7 @@ Resources:
           # Install the files and packages from the metadata
           /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource RHEL6Instance  --region ${AWS::Region}
           pip3 install boto3
+          chmod +x /home/ec2-user/run_entropy.sh
 
   RHEL8Instance:
     Type: AWS::EC2::Instance
@@ -210,6 +214,9 @@ Resources:
                 object_name = filename_rel
                 s3_client = boto3.client('s3')
                 response = s3_client.upload_file(filename_abs, bucket, object_name, ExtraArgs={"ServerSideEncryption": "aws:kms"})
+
+                # kill the entropy_blocking.py script
+                os.system(ps -ef | grep /home/ec2-user/entropy_blocking.py | grep -v grep | awk '{print $2}' | xargs kill)
               owner: "ec2-user"
               group: "ec2-user"
             /home/ec2-user/entropy_blocking.py:
@@ -243,7 +250,7 @@ Resources:
       InstanceType: !Ref InstanceTypeParam
       ImageId: !Ref AMIParamRHEL8
       KeyName: !Ref KeyNameParam
-      IamInstanceProfile: !Ref IAMRole
+      IamInstanceProfile: !Ref EntropyInstanceProfile
       SubnetId: !Ref SubnetParam
       SecurityGroupIds:
         - !Ref MySecurityGroup
@@ -295,6 +302,7 @@ Resources:
           # Install the files and packages from the metadata
           /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource RHEL8Instance  --region ${AWS::Region}
           pip3 install boto3
+          chmod +x /home/ec2-user/run_entropy.sh
 
   MySecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -318,6 +326,45 @@ Resources:
         ToPort: '443'
         CidrIp: 0.0.0.0/0
         Description: https
+
+  EntropyIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+
+  EntropyRolePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: "entropy-research-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action: "s3:PutObject"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketResource}/*'
+      Roles:
+        -
+          Ref: "EntropyIAMRole"
+
+  EntropyInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        -
+          Ref: "EntropyIAMRole"
 
   S3BucketResource:
     Type: AWS::S3::Bucket
@@ -344,7 +391,7 @@ Resources:
             Principal:
               AWS:
                 - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
-                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/entropy-research-s3-upload'
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${EntropyIAMRole}'
             Resource:
               - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketResource}/*'
 
